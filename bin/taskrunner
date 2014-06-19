@@ -24,10 +24,12 @@ into a pipeline and executed by taskrunner.
 import datetime
 import os
 import imp
+import pprint
 import sys
 import logging
 from copy import copy
 from optparse import OptionParser
+import types
 
 import taskrunner
 
@@ -71,9 +73,13 @@ def parse_args():
                       action="store_false", default=True,
                       help="Do not write timestamp at the beggining of each"
                       " log line.")
+    parser.add_option("--list", dest="list",
+                      action="store_true", default=False,
+                      help="List all available or specified target pipelines."
+                           "Do not execute any task.")
 
     options, tasks = parser.parse_args()
-    if not tasks:
+    if not tasks and not options.list:
         print "No task was specified"
         parser.print_help()
         exit(1)
@@ -120,6 +126,80 @@ def get_var_from_modules(modules, var):
         return loaded_var
     else:
         raise Exception("Variable '%s' was not found" % var)
+
+
+def get_submodules(mod, prefix='', basepath=None):
+    if basepath is None:
+        basepath = os.path.dirname(mod.__file__)
+        # LOG.warn('bp for %s is %s', prefix, basepath)
+        # LOG.warn(mod.__file__)
+        # LOG.warn(mod.__package__)
+    submods = dict([(prefix+name, subm)
+                    for (name, subm)
+                    in vars(mod).items()
+                    ])
+    # LOG.info('%s 1st pass: %d', prefix, len(submods))
+    submods = dict([(name, submod)
+                    for (name, submod)
+                    in submods.items()
+                    if isinstance(submod, types.ModuleType)])
+    # LOG.info('%s 2nd pass: %d', prefix, len(submods))
+    submods = dict([(name, submod)
+                    for (name, submod)
+                    in submods.items()
+                    if (getattr(submod, '__file__', None)
+                        and getattr(submod, '__file__').startswith(
+                            basepath))
+                    or (getattr(submod, '__package__', None)
+                        and getattr(submod, '__package__').startswith(
+                            basepath))
+                    ])
+    # LOG.info('%s 3rd pass: %d', prefix, len(submods))
+    # submods = dict([(prefix+name, subm)
+    #                 for (name, subm)
+    #                 in vars(mod).items()
+    #                 if (type(mod) == 'module'
+    #                     and mod.__package__.startswith(basepath))])
+    if not prefix:  # only go one level deep
+        for modname, mod in submods.items():
+            submods.update(get_submodules(mod, modname+'.', basepath))
+    return submods
+
+
+def get_targets_from_module(module, prefix=''):
+    return dict((prefix+name, tgt)
+                for (name, tgt)
+                in vars(module).items()
+                if isinstance(tgt, dict)
+                and tgt.get('task', None))
+
+
+def find_target(target, targets_dict):
+    for name, tgt in targets_dict.iteritems():
+        if target == tgt:
+            return name
+    return None
+
+
+def decompose_pipeline(piple, targets):
+    decomposed = []
+    for member in piple:
+        if isinstance(member, list):
+            decomposed.append(decompose_pipeline(member))
+        elif isinstance(member, dict) and member.get('task', False):
+            name = find_target(member, targets)
+            decomposed.append(name)
+    return decomposed
+
+
+def get_pipelines_from_module(module, targets):
+    piples = {}
+    for (name, tgt) in vars(module).items():
+        if isinstance(tgt, list):
+            decomposed = decompose_pipeline(tgt, targets)
+            if decomposed:
+                piples[name] = decomposed
+    return piples
 
 
 def get_var_from_module(module, var):
@@ -251,6 +331,49 @@ if __name__ == '__main__':
              % datetime.datetime.utcnow())
 
     modules = dict(import_python_file(f) for f in options.files)
+
+    if options.list:
+        for mod_name, module in modules.items():
+
+            targets = get_targets_from_module(module)  # , '(%s.)' % mod_name)
+            submodules = get_submodules(module)
+            for submod_name, submod in submodules.items():
+                targets.update(
+                    get_targets_from_module(submod, submod_name+'.'))
+
+            # add foreign pipelines into targets
+            for submod_name, submod in submodules.items():
+                piples = get_pipelines_from_module(submod, targets)
+                for piple_name, piple in piples.items():
+                    piple_name = submod_name+'.'+piple_name
+                    targets[piple_name] = piple
+
+            # add direct pipelines
+            targets.update(get_pipelines_from_module(module, targets))
+
+            if task_names:
+                targets = dict((name, target)
+                               for (name, target)
+                               in targets.items()
+                               if name in task_names)
+
+            LOG.warn('~~ expanded targets ~~')
+            for target_name in sorted(targets.keys()):
+                target = targets[target_name]
+                if isinstance(target, list):
+                    LOG.info('%s %s', target_name, target)
+                else:
+                    LOG.info('%s  <%s.%s>', target_name,
+                             target['task'].__module__,
+                             target['task'].__name__)
+
+            # LOG.warn('~~ target pipelines in %s ~~', mod_name)
+            # piples = get_pipelines_from_module(module, targets)
+            # for pipe_name, pipe in piples.items():
+            #     LOG.info('(%s.)%s %s',
+            #              mod_name, pipe_name, pipe)
+        sys.exit(0)
+
     pipeline = get_pipeline(modules, task_names)
     redefine_configuration(pipeline, options.redefine)
 
